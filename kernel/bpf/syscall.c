@@ -36,8 +36,9 @@
 #include <linux/rcupdate_trace.h>
 #include <linux/memcontrol.h>
 #include <linux/trace_events.h>
-#include <net/netfilter/nf_bpf_link.h>
 
+#include <net/netfilter/nf_bpf_link.h>
+#include <net/netkit.h>
 #include <net/tcx.h>
 
 #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
@@ -532,6 +533,7 @@ void btf_record_free(struct btf_record *rec)
 		switch (rec->fields[i].type) {
 		case BPF_KPTR_UNREF:
 		case BPF_KPTR_REF:
+		case BPF_KPTR_PERCPU:
 			if (rec->fields[i].kptr.module)
 				module_put(rec->fields[i].kptr.module);
 			btf_put(rec->fields[i].kptr.btf);
@@ -578,6 +580,7 @@ struct btf_record *btf_record_dup(const struct btf_record *rec)
 		switch (fields[i].type) {
 		case BPF_KPTR_UNREF:
 		case BPF_KPTR_REF:
+		case BPF_KPTR_PERCPU:
 			btf_get(fields[i].kptr.btf);
 			if (fields[i].kptr.module && !try_module_get(fields[i].kptr.module)) {
 				ret = -ENXIO;
@@ -642,8 +645,6 @@ void bpf_obj_free_timer(const struct btf_record *rec, void *obj)
 	bpf_timer_cancel_and_free(obj + rec->timer_off);
 }
 
-extern void __bpf_obj_drop_impl(void *p, const struct btf_record *rec);
-
 void bpf_obj_free_fields(const struct btf_record *rec, void *obj)
 {
 	const struct btf_field *fields;
@@ -668,6 +669,7 @@ void bpf_obj_free_fields(const struct btf_record *rec, void *obj)
 			WRITE_ONCE(*(u64 *)field_ptr, 0);
 			break;
 		case BPF_KPTR_REF:
+		case BPF_KPTR_PERCPU:
 			xchgd_field = (void *)xchg((unsigned long *)field_ptr, 0);
 			if (!xchgd_field)
 				break;
@@ -677,8 +679,8 @@ void bpf_obj_free_fields(const struct btf_record *rec, void *obj)
 									   field->kptr.btf_id);
 				migrate_disable();
 				__bpf_obj_drop_impl(xchgd_field, pointee_struct_meta ?
-								 pointee_struct_meta->record :
-								 NULL);
+								 pointee_struct_meta->record : NULL,
+								 fields[i].type == BPF_KPTR_PERCPU);
 				migrate_enable();
 			} else {
 				field->kptr.dtor(xchgd_field);
@@ -1063,6 +1065,7 @@ static int map_check_btf(struct bpf_map *map, const struct btf *btf,
 				break;
 			case BPF_KPTR_UNREF:
 			case BPF_KPTR_REF:
+			case BPF_KPTR_PERCPU:
 			case BPF_REFCOUNT:
 				if (map->map_type != BPF_MAP_TYPE_HASH &&
 				    map->map_type != BPF_MAP_TYPE_PERCPU_HASH &&
@@ -2460,14 +2463,19 @@ bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
 		case BPF_CGROUP_INET6_BIND:
 		case BPF_CGROUP_INET4_CONNECT:
 		case BPF_CGROUP_INET6_CONNECT:
+		case BPF_CGROUP_UNIX_CONNECT:
 		case BPF_CGROUP_INET4_GETPEERNAME:
 		case BPF_CGROUP_INET6_GETPEERNAME:
+		case BPF_CGROUP_UNIX_GETPEERNAME:
 		case BPF_CGROUP_INET4_GETSOCKNAME:
 		case BPF_CGROUP_INET6_GETSOCKNAME:
+		case BPF_CGROUP_UNIX_GETSOCKNAME:
 		case BPF_CGROUP_UDP4_SENDMSG:
 		case BPF_CGROUP_UDP6_SENDMSG:
+		case BPF_CGROUP_UNIX_SENDMSG:
 		case BPF_CGROUP_UDP4_RECVMSG:
 		case BPF_CGROUP_UDP6_RECVMSG:
+		case BPF_CGROUP_UNIX_RECVMSG:
 			return 0;
 		default:
 			return -EINVAL;
@@ -2763,7 +2771,7 @@ free_used_maps:
 	 * period before we can tear down JIT memory since symbols
 	 * are already exposed under kallsyms.
 	 */
-	__bpf_prog_put_noref(prog, prog->aux->func_cnt);
+	__bpf_prog_put_noref(prog, prog->aux->real_func_cnt);
 	return err;
 free_prog_sec:
 	free_uid(prog->aux->user);
@@ -3388,7 +3396,7 @@ static void bpf_perf_link_dealloc(struct bpf_link *link)
 static int bpf_perf_link_fill_common(const struct perf_event *event,
 				     char __user *uname, u32 ulen,
 				     u64 *probe_offset, u64 *probe_addr,
-				     u32 *fd_type)
+				     u32 *fd_type, unsigned long *missed)
 {
 	const char *buf;
 	u32 prog_id;
@@ -3399,7 +3407,7 @@ static int bpf_perf_link_fill_common(const struct perf_event *event,
 		return -EINVAL;
 
 	err = bpf_get_perf_event_info(event, &prog_id, fd_type, &buf,
-				      probe_offset, probe_addr);
+				      probe_offset, probe_addr, missed);
 	if (err)
 		return err;
 	if (!uname)
@@ -3422,6 +3430,7 @@ static int bpf_perf_link_fill_common(const struct perf_event *event,
 static int bpf_perf_link_fill_kprobe(const struct perf_event *event,
 				     struct bpf_link_info *info)
 {
+	unsigned long missed;
 	char __user *uname;
 	u64 addr, offset;
 	u32 ulen, type;
@@ -3430,7 +3439,7 @@ static int bpf_perf_link_fill_kprobe(const struct perf_event *event,
 	uname = u64_to_user_ptr(info->perf_event.kprobe.func_name);
 	ulen = info->perf_event.kprobe.name_len;
 	err = bpf_perf_link_fill_common(event, uname, ulen, &offset, &addr,
-					&type);
+					&type, &missed);
 	if (err)
 		return err;
 	if (type == BPF_FD_TYPE_KRETPROBE)
@@ -3439,6 +3448,7 @@ static int bpf_perf_link_fill_kprobe(const struct perf_event *event,
 		info->perf_event.type = BPF_PERF_EVENT_KPROBE;
 
 	info->perf_event.kprobe.offset = offset;
+	info->perf_event.kprobe.missed = missed;
 	if (!kallsyms_show_value(current_cred()))
 		addr = 0;
 	info->perf_event.kprobe.addr = addr;
@@ -3458,7 +3468,7 @@ static int bpf_perf_link_fill_uprobe(const struct perf_event *event,
 	uname = u64_to_user_ptr(info->perf_event.uprobe.file_name);
 	ulen = info->perf_event.uprobe.name_len;
 	err = bpf_perf_link_fill_common(event, uname, ulen, &offset, &addr,
-					&type);
+					&type, NULL);
 	if (err)
 		return err;
 
@@ -3494,7 +3504,7 @@ static int bpf_perf_link_fill_tracepoint(const struct perf_event *event,
 	uname = u64_to_user_ptr(info->perf_event.tracepoint.tp_name);
 	ulen = info->perf_event.tracepoint.name_len;
 	info->perf_event.type = BPF_PERF_EVENT_TRACEPOINT;
-	return bpf_perf_link_fill_common(event, uname, ulen, NULL, NULL, NULL);
+	return bpf_perf_link_fill_common(event, uname, ulen, NULL, NULL, NULL, NULL);
 }
 
 static int bpf_perf_link_fill_perf_event(const struct perf_event *event,
@@ -3690,14 +3700,19 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
 	case BPF_CGROUP_INET6_BIND:
 	case BPF_CGROUP_INET4_CONNECT:
 	case BPF_CGROUP_INET6_CONNECT:
+	case BPF_CGROUP_UNIX_CONNECT:
 	case BPF_CGROUP_INET4_GETPEERNAME:
 	case BPF_CGROUP_INET6_GETPEERNAME:
+	case BPF_CGROUP_UNIX_GETPEERNAME:
 	case BPF_CGROUP_INET4_GETSOCKNAME:
 	case BPF_CGROUP_INET6_GETSOCKNAME:
+	case BPF_CGROUP_UNIX_GETSOCKNAME:
 	case BPF_CGROUP_UDP4_SENDMSG:
 	case BPF_CGROUP_UDP6_SENDMSG:
+	case BPF_CGROUP_UNIX_SENDMSG:
 	case BPF_CGROUP_UDP4_RECVMSG:
 	case BPF_CGROUP_UDP6_RECVMSG:
+	case BPF_CGROUP_UNIX_RECVMSG:
 		return BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
 	case BPF_CGROUP_SOCK_OPS:
 		return BPF_PROG_TYPE_SOCK_OPS;
@@ -3734,6 +3749,8 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
 		return BPF_PROG_TYPE_LSM;
 	case BPF_TCX_INGRESS:
 	case BPF_TCX_EGRESS:
+	case BPF_NETKIT_PRIMARY:
+	case BPF_NETKIT_PEER:
 		return BPF_PROG_TYPE_SCHED_CLS;
 	default:
 		return BPF_PROG_TYPE_UNSPEC;
@@ -3785,7 +3802,9 @@ static int bpf_prog_attach_check_attach_type(const struct bpf_prog *prog,
 		return 0;
 	case BPF_PROG_TYPE_SCHED_CLS:
 		if (attach_type != BPF_TCX_INGRESS &&
-		    attach_type != BPF_TCX_EGRESS)
+		    attach_type != BPF_TCX_EGRESS &&
+		    attach_type != BPF_NETKIT_PRIMARY &&
+		    attach_type != BPF_NETKIT_PEER)
 			return -EINVAL;
 		return 0;
 	default:
@@ -3868,7 +3887,11 @@ static int bpf_prog_attach(const union bpf_attr *attr)
 			ret = cgroup_bpf_prog_attach(attr, ptype, prog);
 		break;
 	case BPF_PROG_TYPE_SCHED_CLS:
-		ret = tcx_prog_attach(attr, prog);
+		if (attr->attach_type == BPF_TCX_INGRESS ||
+		    attr->attach_type == BPF_TCX_EGRESS)
+			ret = tcx_prog_attach(attr, prog);
+		else
+			ret = netkit_prog_attach(attr, prog);
 		break;
 	default:
 		ret = -EINVAL;
@@ -3929,7 +3952,11 @@ static int bpf_prog_detach(const union bpf_attr *attr)
 		ret = cgroup_bpf_prog_detach(attr, ptype);
 		break;
 	case BPF_PROG_TYPE_SCHED_CLS:
-		ret = tcx_prog_detach(attr, prog);
+		if (attr->attach_type == BPF_TCX_INGRESS ||
+		    attr->attach_type == BPF_TCX_EGRESS)
+			ret = tcx_prog_detach(attr, prog);
+		else
+			ret = netkit_prog_detach(attr, prog);
 		break;
 	default:
 		ret = -EINVAL;
@@ -3963,14 +3990,19 @@ static int bpf_prog_query(const union bpf_attr *attr,
 	case BPF_CGROUP_INET6_POST_BIND:
 	case BPF_CGROUP_INET4_CONNECT:
 	case BPF_CGROUP_INET6_CONNECT:
+	case BPF_CGROUP_UNIX_CONNECT:
 	case BPF_CGROUP_INET4_GETPEERNAME:
 	case BPF_CGROUP_INET6_GETPEERNAME:
+	case BPF_CGROUP_UNIX_GETPEERNAME:
 	case BPF_CGROUP_INET4_GETSOCKNAME:
 	case BPF_CGROUP_INET6_GETSOCKNAME:
+	case BPF_CGROUP_UNIX_GETSOCKNAME:
 	case BPF_CGROUP_UDP4_SENDMSG:
 	case BPF_CGROUP_UDP6_SENDMSG:
+	case BPF_CGROUP_UNIX_SENDMSG:
 	case BPF_CGROUP_UDP4_RECVMSG:
 	case BPF_CGROUP_UDP6_RECVMSG:
+	case BPF_CGROUP_UNIX_RECVMSG:
 	case BPF_CGROUP_SOCK_OPS:
 	case BPF_CGROUP_DEVICE:
 	case BPF_CGROUP_SYSCTL:
@@ -3991,6 +4023,9 @@ static int bpf_prog_query(const union bpf_attr *attr,
 	case BPF_TCX_INGRESS:
 	case BPF_TCX_EGRESS:
 		return tcx_prog_query(attr, uattr);
+	case BPF_NETKIT_PRIMARY:
+	case BPF_NETKIT_PEER:
+		return netkit_prog_query(attr, uattr);
 	default:
 		return -EINVAL;
 	}
@@ -4836,7 +4871,7 @@ static int bpf_task_fd_query(const union bpf_attr *attr,
 
 		err = bpf_get_perf_event_info(event, &prog_id, &fd_type,
 					      &buf, &probe_offset,
-					      &probe_addr);
+					      &probe_addr, NULL);
 		if (!err)
 			err = bpf_task_fd_query_copy(attr, uattr, prog_id,
 						     fd_type, buf,
@@ -4972,7 +5007,11 @@ static int link_create(union bpf_attr *attr, bpfptr_t uattr)
 		ret = bpf_xdp_link_attach(attr, prog);
 		break;
 	case BPF_PROG_TYPE_SCHED_CLS:
-		ret = tcx_link_attach(attr, prog);
+		if (attr->link_create.attach_type == BPF_TCX_INGRESS ||
+		    attr->link_create.attach_type == BPF_TCX_EGRESS)
+			ret = tcx_link_attach(attr, prog);
+		else
+			ret = netkit_link_attach(attr, prog);
 		break;
 	case BPF_PROG_TYPE_NETFILTER:
 		ret = bpf_nf_link_attach(attr, prog);
