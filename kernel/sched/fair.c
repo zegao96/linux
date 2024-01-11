@@ -1006,6 +1006,25 @@ static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	u64 delta_exec;
 
+
+	if (sched_feat(SCHED_QUANTA))
+		goto check_quanta;
+
+	if ((s64)(se->vruntime - se->deadline) < 0)
+		return;
+
+	se->slice = sysctl_sched_base_slice;
+
+	se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
+
+	if (cfs_rq->nr_running > 1) {
+		resched_curr(rq_of(cfs_rq));
+		clear_buddies(cfs_rq, se);
+	}
+
+	return;
+
+check_quanta:
 	/*
 	 * To allow wakeup preemption to happen in time, we check to
 	 * push deadlines forward by each call.
