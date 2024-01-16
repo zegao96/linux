@@ -522,6 +522,49 @@ DEFINE_EVENT(sched_stat_runtime, sched_stat_runtime,
 	     TP_ARGS(tsk, runtime, vruntime));
 
 /*
+ * Tracepoint for EEVDF Clock and Runtime
+ */
+DECLARE_EVENT_CLASS(sched_eevdf_clock,
+
+       TP_PROTO(struct task_struct *tsk, u64 runtime, u64 vruntime, u64 vdeadline, u64 vclock, s64 lag),
+
+       TP_ARGS(tsk, __perf_count(runtime), vruntime, vdeadline, vclock, lag),
+
+       TP_STRUCT__entry(
+               __array( char,  comm,   TASK_COMM_LEN   )
+               __field( pid_t, pid                     )
+               __field( u64,   runtime                 )
+               __field( u64,   vruntime                )
+               __field( u64,   vdeadline               )
+               __field( u64,   vclock                  )
+               __field( s64,   lag                     )
+       ),
+
+       TP_fast_assign(
+               memcpy(__entry->comm, tsk->comm, TASK_COMM_LEN);
+               __entry->pid            = tsk->pid;
+               __entry->runtime        = runtime;
+               __entry->vruntime       = vruntime;
+               __entry->vdeadline      = vdeadline;
+               __entry->vclock         = vclock;
+               __entry->lag            = lag;
+       ),
+
+       TP_printk("comm=%s pid=%d runtime=%Lu [ns] vruntime=%Lu [ns] vdeadline=%Lu [ns] vlock=%Lu [ns] lag=%Ld [ns]",
+                       __entry->comm, __entry->pid,
+                       (unsigned long long)__entry->runtime,
+                       (unsigned long long)__entry->vruntime,
+                       (unsigned long long)__entry->vdeadline,
+                       (unsigned long long)__entry->vclock,
+                       (long long)__entry->lag)
+);
+
+DEFINE_EVENT(sched_eevdf_clock, sched_eevdf_clock,
+            TP_PROTO(struct task_struct *tsk, u64 runtime, u64 vruntime, u64 vdeadline, u64 vclock, s64 lag),
+            TP_ARGS(tsk, runtime, vruntime, vdeadline, vclock, lag));
+
+
+/*
  * Tracepoint for showing priority inheritance modifying a tasks
  * priority.
  */

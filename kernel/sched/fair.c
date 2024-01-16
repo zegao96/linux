@@ -1013,6 +1013,16 @@ static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	if ((s64)(se->vruntime - se->deadline) < 0)
 		return;
 
+	if (entity_is_task(se)) {
+		struct task_struct *curtask = task_of(se);
+		u64 delta = se->sum_exec_runtime - se->prev_sum_exec_runtime;
+		u64 vclock = avg_vruntime(cfs_rq);
+		s64 lag = vclock - se->vruntime;
+
+		trace_sched_eevdf_clock(curtask, delta, se->vruntime, se->deadline, vclock, lag);
+	}
+
+
 	if (!se->custom_slice)
 		se->slice = sysctl_sched_base_slice;
 
